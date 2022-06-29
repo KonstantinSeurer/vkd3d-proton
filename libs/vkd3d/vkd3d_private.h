@@ -740,17 +740,42 @@ HRESULT vkd3d_memory_allocator_flush_clears(struct vkd3d_memory_allocator *alloc
 /* ID3D12Heap */
 typedef ID3D12Heap1 d3d12_heap_iface;
 
+#ifdef VKD3D_ENABLE_DESCRIPTOR_QA
+struct d3d12_heap_resource_placement
+{
+    struct d3d12_resource *resource;
+    VkDeviceSize heap_offset;
+    VkDeviceSize size;
+};
+#endif
+
 struct d3d12_heap
 {
     d3d12_heap_iface ID3D12Heap_iface;
     LONG refcount;
+    LONG internal_refcount;
 
     D3D12_HEAP_DESC desc;
     struct vkd3d_memory_allocation allocation;
 
+#ifdef VKD3D_ENABLE_DESCRIPTOR_QA
+    struct d3d12_heap_resource_placement *placements;
+    size_t placements_count;
+    size_t placements_size;
+    pthread_mutex_t placement_lock;
+#endif
+
     struct d3d12_device *device;
     struct vkd3d_private_store private_store;
 };
+
+#ifdef VKD3D_ENABLE_DESCRIPTOR_QA
+void d3d12_heap_register_placed_resource(struct d3d12_heap *heap, struct d3d12_resource *resource,
+        VkDeviceSize heap_offset, VkDeviceSize required_size);
+void d3d12_heap_unregister_placed_resource(struct d3d12_heap *heap, struct d3d12_resource *resource);
+#endif
+void d3d12_heap_inc_ref(struct d3d12_heap *heap);
+void d3d12_heap_dec_ref(struct d3d12_heap *heap);
 
 HRESULT d3d12_heap_create(struct d3d12_device *device, const D3D12_HEAP_DESC *desc,
         void *host_address, struct d3d12_heap **heap);

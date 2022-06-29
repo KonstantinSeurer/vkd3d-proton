@@ -1419,7 +1419,14 @@ static ULONG d3d12_resource_decref(struct d3d12_resource *resource)
     TRACE("%p decreasing refcount to %u.\n", resource, refcount);
 
     if (!refcount)
+    {
+        VKD3D_UNUSED struct d3d12_heap *heap = resource->heap;
         d3d12_resource_destroy(resource, resource->device);
+#ifdef VKD3D_ENABLE_DESCRIPTOR_QA
+        if (heap)
+            d3d12_heap_dec_ref(heap);
+#endif
+    }
 
     return refcount;
 }
@@ -1511,7 +1518,6 @@ static ULONG STDMETHODCALLTYPE d3d12_resource_AddRef(d3d12_resource_iface *iface
     if (refcount == 1)
     {
         struct d3d12_device *device = resource->device;
-
         d3d12_device_add_ref(device);
         d3d12_resource_incref(resource);
     }
@@ -2605,6 +2611,11 @@ static void d3d12_resource_destroy(struct d3d12_resource *resource, struct d3d12
     if (resource->vrs_view)
         VK_CALL(vkDestroyImageView(device->vk_device, resource->vrs_view, NULL));
 
+#ifdef VKD3D_ENABLE_DESCRIPTOR_QA
+    if (resource->heap)
+        d3d12_heap_unregister_placed_resource(resource->heap, resource);
+#endif
+
     vkd3d_private_store_destroy(&resource->private_store);
     d3d12_device_release(resource->device);
     vkd3d_free(resource);
@@ -2861,6 +2872,7 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
 {
     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
     VkMemoryRequirements memory_requirements;
+    VKD3D_UNUSED VkDeviceSize required_size;
     VkBindImageMemoryInfo bind_info;
     struct d3d12_resource *object;
     bool force_committed;
@@ -2910,11 +2922,13 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
 
         if (heap_offset + memory_requirements.size > heap->allocation.resource.size)
         {
-            ERR("Heap too small for the texture (heap=%"PRIu64", res=%"PRIu64".\n",
+            ERR("Heap too small for the texture (heap=%"PRIu64", res=%"PRIu64").\n",
                 heap->allocation.resource.size, heap_offset + memory_requirements.size);
             hr = E_INVALIDARG;
             goto fail;
         }
+
+        required_size = memory_requirements.size;
     }
     else
     {
@@ -2925,6 +2939,8 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
             hr = E_INVALIDARG;
             goto fail;
         }
+
+        required_size = desc->Width;
     }
 
     vkd3d_memory_allocation_slice(&object->mem, &heap->allocation, heap_offset, 0);
@@ -2956,6 +2972,11 @@ HRESULT d3d12_resource_create_placed(struct d3d12_device *device, const D3D12_RE
         if (FAILED(hr = vkd3d_resource_make_vrs_view(device, object->res.vk_image, &object->vrs_view)))
             goto fail;
     }
+
+#ifdef VKD3D_ENABLE_DESCRIPTOR_QA
+    d3d12_heap_register_placed_resource(heap, object, heap_offset, required_size);
+    d3d12_heap_inc_ref(heap);
+#endif
 
     *resource = object;
     return S_OK;

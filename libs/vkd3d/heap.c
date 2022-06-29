@@ -59,9 +59,13 @@ static void d3d12_heap_destroy(struct d3d12_heap *heap)
 {
     TRACE("Destroying heap %p.\n", heap);
 
+#ifdef VKD3D_ENABLE_DESCRIPTOR_QA
+    vkd3d_free(heap->placements);
+    pthread_mutex_destroy(&heap->placement_lock);
+#endif
+
     vkd3d_free_memory(heap->device, &heap->device->memory_allocator, &heap->allocation);
     vkd3d_private_store_destroy(&heap->private_store);
-    d3d12_device_release(heap->device);
     vkd3d_free(heap);
 }
 
@@ -72,6 +76,18 @@ static void d3d12_heap_set_name(struct d3d12_heap *heap, const char *name)
                 VK_OBJECT_TYPE_DEVICE_MEMORY, name);
 }
 
+void d3d12_heap_dec_ref(struct d3d12_heap *heap)
+{
+    ULONG refcount = InterlockedDecrement(&heap->internal_refcount);
+    if (!refcount)
+        d3d12_heap_destroy(heap);
+}
+
+void d3d12_heap_inc_ref(struct d3d12_heap *heap)
+{
+    InterlockedIncrement(&heap->internal_refcount);
+}
+
 static ULONG STDMETHODCALLTYPE d3d12_heap_Release(d3d12_heap_iface *iface)
 {
     struct d3d12_heap *heap = impl_from_ID3D12Heap1(iface);
@@ -80,7 +96,11 @@ static ULONG STDMETHODCALLTYPE d3d12_heap_Release(d3d12_heap_iface *iface)
     TRACE("%p decreasing refcount to %u.\n", heap, refcount);
 
     if (!refcount)
-        d3d12_heap_destroy(heap);
+    {
+        struct d3d12_device *device = heap->device;
+        d3d12_heap_dec_ref(heap);
+        d3d12_device_release(device);
+    }
 
     return refcount;
 }
@@ -216,6 +236,117 @@ static HRESULT validate_heap_desc(struct d3d12_device *device, const D3D12_HEAP_
     return S_OK;
 }
 
+#ifdef VKD3D_ENABLE_DESCRIPTOR_QA
+static bool d3d12_resource_is_linear_placement(const struct d3d12_resource *resource)
+{
+    return (resource->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER &&
+            !(resource->flags & VKD3D_RESOURCE_ACCELERATION_STRUCTURE)) ||
+            (resource->flags & VKD3D_RESOURCE_LINEAR_TILING);
+}
+
+static void d3d12_resource_report_parameters(char *buf, size_t buf_size, const struct d3d12_resource *resource)
+{
+    if (resource->desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER)
+    {
+        snprintf(buf, buf_size,
+                "IMAGE: format = %s, width = %"PRIu64", height = %u, depth/layers = %u, levels = %u, flags = #%x",
+                debug_dxgi_format(resource->desc.Format),
+                resource->desc.Width,
+                resource->desc.Height,
+                resource->desc.DepthOrArraySize,
+                resource->desc.MipLevels,
+                resource->desc.Flags);
+    }
+    else if (resource->flags & VKD3D_RESOURCE_ACCELERATION_STRUCTURE)
+        snprintf(buf, buf_size, "RTAS");
+    else
+        snprintf(buf, buf_size, "BUFFER");
+}
+
+void d3d12_heap_register_placed_resource(struct d3d12_heap *heap,
+        struct d3d12_resource *resource,
+        VkDeviceSize heap_offset, VkDeviceSize required_size)
+{
+    const struct d3d12_heap_resource_placement *placement;
+    bool candidate_resource_is_linear;
+    bool placed_resource_is_linear;
+    VkDeviceSize begin_overlap;
+    VkDeviceSize end_overlap;
+    char report_buffer[1024];
+    bool has_alias = false;
+    const char *msg;
+    size_t i;
+
+    /* Linear aliasing with other linear resources is fine.
+     * Image <-> Image, and Image <-> Buffer is far more dangerous however. */
+    placed_resource_is_linear = d3d12_resource_is_linear_placement(resource);
+
+    pthread_mutex_lock(&heap->placement_lock);
+
+    for (i = 0; i < heap->placements_count; i++)
+    {
+        placement = &heap->placements[i];
+        candidate_resource_is_linear = d3d12_resource_is_linear_placement(placement->resource);
+
+        begin_overlap = max(placement->heap_offset, heap_offset);
+        end_overlap = min(placement->heap_offset + placement->size, heap_offset + required_size);
+
+        if (begin_overlap < end_overlap && candidate_resource_is_linear != placed_resource_is_linear)
+        {
+            /* Overlap. */
+            /* Potentially problematic scenario, report this. */
+            if (!has_alias)
+            {
+                if (resource->desc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER)
+                    msg = "Attempting to place linear buffer resource on heap, placement aliases with non-linear layout.";
+                else
+                    msg = "Attempting to place opaque resource on heap, placement aliases with other resources.";
+
+                d3d12_resource_report_parameters(report_buffer, sizeof(report_buffer), resource);
+                INFO("\n%s\n  New placement: resource cookie = %"PRIu64", offset = %"PRIu64", size = %"PRIu64", VA = %"PRIx64"\n\t%s\n",
+                        msg,
+                        resource->res.cookie,
+                        heap_offset, required_size, resource->res.va,
+                        report_buffer);
+
+                has_alias = true;
+            }
+
+            d3d12_resource_report_parameters(report_buffer, sizeof(report_buffer), placement->resource);
+            INFO("\n   Existing aliasing resource : cookie = %"PRIu64", offset = %"PRIu64", size = %"PRIu64".\n\t\t%s\n",
+                    placement->resource->res.cookie, placement->heap_offset, placement->size,
+                    report_buffer);
+        }
+    }
+
+    vkd3d_array_reserve((void**)&heap->placements, &heap->placements_size,
+            heap->placements_count + 1, sizeof(*heap->placements));
+
+    heap->placements[heap->placements_count].resource = resource;
+    heap->placements[heap->placements_count].heap_offset = heap_offset;
+    heap->placements[heap->placements_count].size = required_size;
+    heap->placements_count++;
+
+    pthread_mutex_unlock(&heap->placement_lock);
+}
+
+void d3d12_heap_unregister_placed_resource(struct d3d12_heap *heap, struct d3d12_resource *resource)
+{
+    size_t i;
+
+    pthread_mutex_lock(&heap->placement_lock);
+    for (i = 0; i < heap->placements_count; i++)
+    {
+        if (heap->placements[i].resource == resource)
+        {
+            heap->placements[i] = heap->placements[--heap->placements_count];
+            break;
+        }
+    }
+    pthread_mutex_unlock(&heap->placement_lock);
+}
+#endif
+
 static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *device,
         const D3D12_HEAP_DESC *desc, void* host_address)
 {
@@ -225,6 +356,7 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
     memset(heap, 0, sizeof(*heap));
     heap->ID3D12Heap_iface.lpVtbl = &d3d12_heap_vtbl;
     heap->refcount = 1;
+    heap->internal_refcount = 1;
     heap->desc = *desc;
     heap->device = device;
 
@@ -251,6 +383,10 @@ static HRESULT d3d12_heap_init(struct d3d12_heap *heap, struct d3d12_device *dev
         vkd3d_private_store_destroy(&heap->private_store);
         return hr;
     }
+
+#ifdef VKD3D_ENABLE_DESCRIPTOR_QA
+    pthread_mutex_init(&heap->placement_lock, NULL);
+#endif
 
     d3d12_device_add_ref(heap->device);
     return S_OK;
